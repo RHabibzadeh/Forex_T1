@@ -1,0 +1,243 @@
+//+------------------------------------------------------------------+
+//|                                       ADX_PinBar_System.mq5      |
+//|        سیستم ترکیبی: ADX (فیلتر/جهت) + پین‌بار (ماشه)            |
+//|                  صرفاً آموزشی - ابتدا روی دمو تست شود             |
+//+------------------------------------------------------------------+
+#property copyright "Educational Use Only"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- پارامترهای ورودی ------------------------------------------------
+input group "=== فیلتر روند (ADX) ==="
+input ENUM_TIMEFRAMES  InpTrendTF      = PERIOD_H1;   // تایم‌فریم تحلیل روند
+input int              InpADXPeriod    = 14;          // دوره ADX
+input double           InpADXThreshold = 25.0;        // حداقل ADX برای روند
+
+input group "=== ماشه ورود (پین‌بار) ==="
+input ENUM_TIMEFRAMES  InpEntryTF      = PERIOD_M5;   // تایم‌فریم ورود
+input double           InpWickRatio    = 2.0;         // نسبت حداقلی سایه به بدنه
+
+input group "=== مدیریت معامله ==="
+input double           InpRiskPercent  = 1.0;         // درصد ریسک هر معامله
+input double           InpRR           = 2.0;         // نسبت ریسک به ریوارد
+input double           InpSLBufferPips = 2.0;         // بافر اضافه پشت پین‌بار (پیپ)
+input bool             InpUseBreakeven = true;        // فعال‌سازی Break-even در ۱:۱
+
+input group "=== فیلتر زمانی ==="
+input bool             InpUseTimeFilter= true;        // فقط در ساعات همپوشانی
+input int              InpStartHour    = 13;          // ساعت شروع (سرور)
+input int              InpEndHour      = 17;          // ساعت پایان (سرور)
+
+input group "=== عمومی ==="
+input ulong            InpMagic        = 20260614;    // مجیک نامبر
+
+//--- متغیرهای سراسری -------------------------------------------------
+int    hADX_trend;        // هندل ADX روی تایم‌فریم روند
+double point;
+double pip;               // اندازه یک پیپ
+int    digitsAdjust;
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   hADX_trend = iADX(_Symbol, InpTrendTF, InpADXPeriod);
+   if(hADX_trend == INVALID_HANDLE)
+     {
+      Print("خطا در ساخت هندل ADX");
+      return(INIT_FAILED);
+     }
+
+   point = _Point;
+   // تعیین اندازه پیپ (۵ یا ۳ رقم اعشار -> پیپ = ۱۰ پوینت)
+   if(_Digits == 5 || _Digits == 3)
+      pip = point * 10.0;
+   else
+      pip = point;
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   if(hADX_trend != INVALID_HANDLE)
+      IndicatorRelease(hADX_trend);
+  }
+
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   // مدیریت معامله باز (Break-even) در هر تیک
+   ManageOpenPositions();
+
+   // فقط یک بار در هر کندل جدید M5 منطق ورود اجرا شود
+   if(!IsNewEntryBar())
+      return;
+
+   // اگر معامله‌ای باز است، ورود جدید نگیر
+   if(HasOpenPosition())
+      return;
+
+   // --- فیلتر زمانی ---
+   if(InpUseTimeFilter && !IsTradingHour())
+      return;
+
+   // --- لایه ۱ و ۲: فیلتر و جهت روند با ADX ---
+   double adx, plusDI, minusDI;
+   if(!GetADXValues(adx, plusDI, minusDI))
+      return;
+
+   if(adx < InpADXThreshold)   // روند کافی نیست -> بازار رنج
+      return;
+
+   bool trendUp   = (plusDI > minusDI);
+   bool trendDown = (minusDI > plusDI);
+
+   // --- لایه ۳: ماشه پین‌بار روی کندل بسته‌شده M5 ---
+   if(trendUp && IsBullishPinBar(1))
+      OpenTrade(ORDER_TYPE_BUY);
+   else if(trendDown && IsBearishPinBar(1))
+      OpenTrade(ORDER_TYPE_SELL);
+  }
+
+//+------------------------------------------------------------------+
+//| خواندن مقادیر ADX و DI از آخرین کندل بسته‌شده                     |
+//+------------------------------------------------------------------+
+bool GetADXValues(double &adx, double &plusDI, double &minusDI)
+  {
+   double bufADX[], bufPlus[], bufMinus[];
+   if(CopyBuffer(hADX_trend, 0, 1, 1, bufADX)   <= 0) return(false); // MAIN
+   if(CopyBuffer(hADX_trend, 1, 1, 1, bufPlus)  <= 0) return(false); // +DI
+   if(CopyBuffer(hADX_trend, 2, 1, 1, bufMinus) <= 0) return(false); // -DI
+
+   adx     = bufADX[0];
+   plusDI  = bufPlus[0];
+   minusDI = bufMinus[0];
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| تشخیص پین‌بار صعودی (سایه پایینی بلند)                            |
+//+------------------------------------------------------------------+
+bool IsBullishPinBar(int shift)
+  {
+   double o = iOpen(_Symbol,  InpEntryTF, shift);
+   double c = iClose(_Symbol, InpEntryTF, shift);
+   double h = iHigh(_Symbol,  InpEntryTF, shift);
+   double l = iLow(_Symbol,   InpEntryTF, shift);
+
+   double body       = MathAbs(c - o);
+   double lowerWick  = MathMin(o, c) - l;
+   double upperWick  = h - MathMax(o, c);
+
+   if(body <= 0) body = point; // جلوگیری از تقسیم بر صفر
+
+   // سایه پایینی حداقل n برابر بدنه، و بلندتر از سایه بالایی
+   return (lowerWick >= InpWickRatio * body && lowerWick > upperWick);
+  }
+
+//+------------------------------------------------------------------+
+//| تشخیص پین‌بار نزولی (سایه بالایی بلند)                            |
+//+------------------------------------------------------------------+
+bool IsBearishPinBar(int shift)
+  {
+   double o = iOpen(_Symbol,  InpEntryTF, shift);
+   double c = iClose(_Symbol, InpEntryTF, shift);
+   double h = iHigh(_Symbol,  InpEntryTF, shift);
+   double l = iLow(_Symbol,   InpEntryTF, shift);
+
+   double body       = MathAbs(c - o);
+   double lowerWick  = MathMin(o, c) - l;
+   double upperWick  = h - MathMax(o, c);
+
+   if(body <= 0) body = point;
+
+   return (upperWick >= InpWickRatio * body && upperWick > lowerWick);
+  }
+
+//+------------------------------------------------------------------+
+//| باز کردن معامله با محاسبه SL/TP و حجم بر اساس ریسک                |
+//+------------------------------------------------------------------+
+void OpenTrade(ENUM_ORDER_TYPE type)
+  {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   double entry, sl, tp;
+   double buffer = InpSLBufferPips * pip;
+
+   double pinHigh = iHigh(_Symbol, InpEntryTF, 1);
+   double pinLow  = iLow(_Symbol,  InpEntryTF, 1);
+
+   if(type == ORDER_TYPE_BUY)
+     {
+      entry = ask;
+      sl    = pinLow - buffer;
+      double slDist = entry - sl;
+      if(slDist <= 0) return;
+      tp = entry + slDist * InpRR;
+     }
+   else
+     {
+      entry = bid;
+      sl    = pinHigh + buffer;
+      double slDist = sl - entry;
+      if(slDist <= 0) return;
+      tp = entry - slDist * InpRR;
+     }
+
+   double lots = CalcLotByRisk(entry, sl);
+   if(lots <= 0) return;
+
+   sl = NormalizeDouble(sl, _Digits);
+   tp = NormalizeDouble(tp, _Digits);
+
+   bool ok;
+   if(type == ORDER_TYPE_BUY)
+      ok = trade.Buy(lots, _Symbol, 0.0, sl, tp, "ADX_PinBar_BUY");
+   else
+      ok = trade.Sell(lots, _Symbol, 0.0, sl, tp, "ADX_PinBar_SELL");
+
+   if(!ok)
+      PrintFormat("خطا در ارسال سفارش: %d", trade.ResultRetcode());
+  }
+
+//+------------------------------------------------------------------+
+//| محاسبه حجم لات بر اساس درصد ریسک                                  |
+//+------------------------------------------------------------------+
+double CalcLotByRisk(double entry, double sl)
+  {
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * InpRiskPercent / 100.0;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize == 0 || tickValue == 0) return(0);
+
+   double slDistance = MathAbs(entry - sl);
+   double lossPerLot = (slDistance / tickSize) * tickValue;
+   if(lossPerLot <= 0) return(0);
+
+   double lots = riskMoney / lossPerLot;
+
+   // اعمال محدودیت‌های نماد
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lots = MathFloor(lots / lotStep) * lotStep;
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+
+   return(NormalizeDouble(lots, 2));
+  }
+
+//+------------------------------------------------------------------+
+//| مدیریت پوزیشن باز: انتقال SL به نقطه ورود در ۱:۱                  |
+//+------------------------------------------------------------------+
+void ManageOp
